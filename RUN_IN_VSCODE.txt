@@ -1,0 +1,72 @@
+GIT TICKET BUG PROJECT — RUN AGAIN IN VS CODE
+================================================
+
+PROJECT FOLDER
+--------------
+/home/dwiz/Desktop/Git_ticket_bug _project
+
+This project is a Jupyter notebook. The main file is:
+agentic_issue_triage.ipynb
+
+The notebook runs the synthetic ticket-triage demo, saves a result in
+triage.db, starts a local API at http://127.0.0.1:8000, and sends a sample
+triage request. Keep the notebook running to keep the API available.
+
+ONE-TIME SETUP
+--------------
+1. Open VS Code.
+2. Choose File > Open Folder... and select the project folder listed above.
+3. Install the recommended VS Code extensions: Python and Jupyter.
+4. Open Terminal > New Terminal and run these commands (the quotes matter
+   because the folder name contains spaces):
+
+   cd "/home/dwiz/Desktop/Git_ticket_bug _project"
+   python3 -m venv .venv
+   .venv/bin/python -m pip install -r requirements.txt
+   .venv/bin/python -m ipykernel install --user --name git-ticket-bug --display-name "Python (Git Ticket Bug)"
+
+If `.venv` already exists, skip `python3 -m venv .venv`.
+If `pip install` reports a network or DNS error, connect to the internet and
+rerun the install command.
+
+RUN IT EACH TIME
+----------------
+1. Open the project folder in VS Code.
+2. Open `agentic_issue_triage.ipynb`.
+3. If asked to select a kernel, choose `Python (Git Ticket Bug)` or the Python
+   interpreter at `.venv/bin/python` inside this folder.
+4. Use the notebook toolbar's `Run All` button and wait for the final API cell
+   to finish. The synthetic demo is selected by default; no GitHub token is
+   needed.
+
+CHECK THAT IT WORKS
+-------------------
+Open this address in your browser:
+
+   http://127.0.0.1:8000/docs
+
+You should see the FastAPI page titled `Agentic Issue Triage` and the `POST
+/triage` endpoint. You can also open a second VS Code terminal and run:
+
+   curl -s -X POST http://127.0.0.1:8000/triage \
+     -H 'Content-Type: application/json' \
+     -d '{"number":9002,"title":"Session cookie stays valid after logout","body":"Security issue: logout does not invalidate the cookie."}'
+
+A working API returns JSON with fields such as `severity`, `files`, and
+`report`. The notebook's last cell also prints a successful HTTP status code
+and a triage report. If you restart or interrupt the notebook kernel, press
+`Run All` again to restart the API.
+
+EMBEDDING NOTE
+--------------
+When available, the notebook uses the BGE sentence-transformer model. That
+requires installing `sentence-transformers` (and PyTorch) and downloading the
+model the first time. If these are unavailable, the synthetic workflow uses
+an offline hashing-embedding fallback. That fallback is suitable for checking
+that the app runs; do not use its measured accuracy as a real model result.
+
+To install the optional BGE backend when internet access is available:
+
+   .venv/bin/python -m pip install sentence-transformers
+
+To stop the running app, interrupt the notebook kernel with the stop button.

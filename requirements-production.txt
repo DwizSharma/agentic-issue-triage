@@ -1,0 +1,15 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+pydantic>=2.8,<3
+sqlalchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+requests>=2.32,<3
+numpy>=2.0,<3
+pandas>=2.2,<4
+scikit-learn>=1.5,<2
+rank-bm25>=0.2,<1
+qdrant-client>=1.13,<2
+langgraph>=1.0,<2
+
+# Optional semantic embeddings (requires PyTorch and downloads the BGE model):
+# sentence-transformers>=3.0,<7
