@@ -12,5 +12,9 @@ qdrant-client>=1.13,<2
 langgraph>=1.0,<2
 python-dotenv>=1.0,<2
 
+# Optional: connect to Ollama or any OpenAI-compatible LLM server
+# for real repro-test generation (set LLM_BACKEND=openai_compat in .env):
+openai>=1.0,<2
+
 # Optional semantic embeddings (requires PyTorch and downloads the BGE model):
 # sentence-transformers>=3.0,<7

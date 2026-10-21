@@ -54,6 +54,8 @@ CFG["DUP_THRESHOLD"] = float(os.getenv("DUP_THRESHOLD", CFG["DUP_THRESHOLD"]))
 CFG["MAX_ISSUES"] = int(os.getenv("MAX_ISSUES", CFG["MAX_ISSUES"]))
 CFG["MAX_COMMITS"] = int(os.getenv("MAX_COMMITS", CFG["MAX_COMMITS"]))
 CFG["LLM_BACKEND"] = os.getenv("LLM_BACKEND", "stub")
+CFG["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL", CFG["OPENAI_BASE_URL"])
+CFG["OPENAI_MODEL"] = os.getenv("OPENAI_MODEL", CFG["OPENAI_MODEL"])
 
 # Seed only the module-level RNG instances; do not touch the global state
 _rng = random.Random(CFG["SEED"])
@@ -941,84 +943,142 @@ def suggest_assignees(issue, files, suspects, topn=3, half_life_days=90):
 # LLM repro-test generation
 # ---------------------------------------------------------------------------
 
-# Thread-safety: _hf_pipe is only written under the pipeline_lock in app.py
+# ---------------------------------------------------------------------------
+# LLM client — thread-safe singleton
+# ---------------------------------------------------------------------------
+
+# Thread-safety: _hf_pipe is only written under _hf_pipe_lock
 _hf_pipe = None
 _hf_pipe_lock = threading.Lock()
+
+# Ollama / OpenAI-compat client is stateless — safe to reuse across threads
+_openai_client = None
+_openai_client_lock = threading.Lock()
+
+# Read LLM timeout from env (seconds); Ollama on CPU can be slow
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SECONDS", "120"))
+
+
+def _get_openai_client():
+    """Return a cached OpenAI-compat client (thread-safe lazy init)."""
+    global _openai_client
+    with _openai_client_lock:
+        if _openai_client is None:
+            from openai import OpenAI  # noqa: E402
+            _openai_client = OpenAI(
+                base_url=CFG["OPENAI_BASE_URL"],
+                api_key=os.getenv("OPENAI_API_KEY", "none"),
+                timeout=LLM_TIMEOUT,
+                max_retries=2,          # retry transient network errors automatically
+            )
+            LOG.info(
+                "OpenAI-compat client initialised (base_url=%s, model=%s, timeout=%ds)",
+                CFG["OPENAI_BASE_URL"], CFG["OPENAI_MODEL"], LLM_TIMEOUT,
+            )
+    return _openai_client
 
 
 def llm_generate(system, user, max_new_tokens=700):
     """
     Call the configured LLM backend and return the generated text, or None
-    if the backend is 'stub'.
+    if the backend is 'stub' or the call fails.
+
+    Backends:
+      stub          — no LLM; caller falls back to stub_repro()
+      openai_compat — Ollama, vLLM, LM Studio, OpenAI API, etc.
+      hf            — local Hugging Face transformers pipeline
     """
     global _hf_pipe
     backend = CFG["LLM_BACKEND"]
 
-    if backend == "hf":
-        with _hf_pipe_lock:
-            if _hf_pipe is None:
-                from transformers import pipeline as hf_pipeline  # noqa: E402
-                _hf_pipe = hf_pipeline(
-                    "text-generation",
-                    model=CFG["HF_MODEL"],
-                    device_map="auto",
-                    torch_dtype="auto",
-                )
-        msgs = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-        return _hf_pipe(
-            msgs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-        )[0]["generated_text"][-1]["content"]
-
+    # ── Ollama / any OpenAI-compatible server ──────────────────────────────
     if backend == "openai_compat":
-        from openai import OpenAI  # noqa: E402
-        client = OpenAI(
-            base_url=CFG["OPENAI_BASE_URL"],
-            api_key=os.getenv("OPENAI_API_KEY", "none"),
-        )
-        resp = client.chat.completions.create(
-            model=CFG["OPENAI_MODEL"],
-            temperature=0,
-            max_tokens=max_new_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        return resp.choices[0].message.content
+        try:
+            client = _get_openai_client()
+            resp = client.chat.completions.create(
+                model=CFG["OPENAI_MODEL"],
+                temperature=0.2,        # slight creativity helps test quality
+                max_tokens=max_new_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+            )
+            content = resp.choices[0].message.content
+            LOG.debug(
+                "LLM response: model=%s tokens_used=%s",
+                CFG["OPENAI_MODEL"],
+                resp.usage.total_tokens if resp.usage else "?",
+            )
+            return content
+        except Exception as exc:
+            LOG.warning(
+                "LLM call failed (backend=%s model=%s): %s — falling back to stub",
+                backend, CFG["OPENAI_MODEL"], exc,
+            )
+            return None
 
-    # "stub" — no LLM; template is generated in n_repro
+    # ── Local Hugging Face transformers ────────────────────────────────────
+    if backend == "hf":
+        try:
+            with _hf_pipe_lock:
+                if _hf_pipe is None:
+                    from transformers import pipeline as hf_pipeline  # noqa: E402
+                    _hf_pipe = hf_pipeline(
+                        "text-generation",
+                        model=CFG["HF_MODEL"],
+                        device_map="auto",
+                        torch_dtype="auto",
+                    )
+                    LOG.info("HF pipeline loaded: %s", CFG["HF_MODEL"])
+            msgs = [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ]
+            return _hf_pipe(
+                msgs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )[0]["generated_text"][-1]["content"]
+        except Exception as exc:
+            LOG.warning("HF pipeline call failed: %s — falling back to stub", exc)
+            return None
+
+    # ── stub — no LLM ──────────────────────────────────────────────────────
     return None
 
 
 def stub_repro(issue, path, text):
-    """Generate a syntactically valid (but hollow) pytest stub."""
+    """Generate a syntactically valid (but hollow) pytest stub as a fallback."""
     funcs = re.findall(r"^def (\w+)\(", text, re.M) or ["target_function"]
     mod = path[:-3].replace("/", ".") if path.endswith(".py") else path
     return (
-        f"```python\n"
-        f"import pytest\n"
+        "```python\n"
+        "import pytest\n"
         f"from {mod} import {funcs[0]}\n\n"
         f"def test_regression_issue_{issue['id']}():\n"
         f'    """Repro for: {issue["title"][:80].replace(chr(34), chr(39))}"""\n'
         f"    ctx = {{\"state\": {{}}}}\n"
         f"    result = {funcs[0]}(ctx)\n"
-        f"    # TODO: replace with the expected behaviour described in the report\n"
-        f"    assert result is not None\n"
-        f"```"
+        "    # TODO: replace with the expected behaviour described in the report\n"
+        "    assert result is not None\n"
+        "```"
     )
 
 
-REPRO_SYS = (
-    "You are a senior engineer. Write ONE minimal, deterministic pytest test that "
-    "reproduces the reported bug against the given source file. The test must FAIL "
-    "on the buggy behaviour. Import only from the repo and the standard library. "
-    "Output only a single ```python code block."
-)
+# Richer system prompt — instructs the LLM to use the suspect commit context
+REPRO_SYS = """\
+You are a senior software engineer writing a regression test for a confirmed bug.
+
+Rules:
+1. Output ONLY a single ```python code block — no prose, no explanation.
+2. The test function name MUST start with `test_`.
+3. Import only from the standard library and the modules shown in the source file.
+4. The test MUST fail when run against the buggy code and pass after the fix.
+5. Keep the test short (under 20 lines). Prefer asserting a concrete wrong value
+   over a generic `assert False`.
+6. Use the suspect commit diff to understand WHAT changed and WHY it is wrong.\
+"""
 
 
 def extract_code(txt):
