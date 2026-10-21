@@ -1,14 +1,37 @@
-# Git Ticket Bug Project
+# Agentic Issue Triage
 
-This repository has two ways to run the triage system:
+An agentic ML pipeline that automatically triages GitHub bug reports. For every incoming issue it:
 
-- **Deployable API:** standalone FastAPI service in `app.py`, with PostgreSQL
-  for triage records, Qdrant for vector search, API-key protection, and
-  optional signed GitHub webhooks.
-- **Notebook demo:** `agentic_issue_triage.ipynb` for exploring the synthetic
-  workflow in VS Code.
+1. **Classifies severity** (critical / high / medium / low) via logistic regression + keyword rules
+2. **Detects duplicates** using vector similarity in Qdrant
+3. **Localises the bug** to the top-5 most likely source files via hybrid BM25 + dense retrieval (RRF fusion)
+4. **Blames a suspect commit** by scoring commit diffs against the issue text
+5. **Suggests assignees** using recency-weighted commit ownership
+6. **Generates a pytest repro test** via an LLM (Qwen2.5-Coder, Ollama, or a template stub)
+7. **Produces a Markdown report** ready to post as a GitHub comment
 
-## Start the deployment locally
+The pipeline is implemented with [LangGraph](https://github.com/langchain-ai/langgraph), persisted to PostgreSQL (SQLite fallback for local dev), and served via FastAPI.
+
+---
+
+## Quick start — run locally (no Docker)
+
+If you have the `.venv` already set up:
+
+```bash
+# Install dependencies
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+# Start the API (reads .env automatically)
+.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+The service reads `.env` on startup via `python-dotenv`, so no `source .env` step is needed. It will use SQLite as the database and an in-memory Qdrant instance by default — no external services required.
+
+---
+
+## Quick start — Docker deployment
 
 Docker and Docker Compose are required. From this folder:
 
@@ -16,78 +39,156 @@ Docker and Docker Compose are required. From this folder:
 ./deploy.sh
 ```
 
-The script creates a private `.env` with random API and database secrets on
-first run, builds the API image, starts PostgreSQL and Qdrant with persistent
-volumes, and waits for the API health check. Compose keeps the service running
-after terminal exit and restarts it after a machine reboot when Docker starts.
-By default the API binds only to `127.0.0.1:8000`.
+The script:
+- Creates a private `.env` with randomly generated secrets on first run
+- Builds the API image, starts PostgreSQL and Qdrant with persistent volumes
+- Waits for all services to pass their health checks (up to 15 minutes)
+- Prints a final readiness curl to confirm the API is live
 
-Check live and ready status:
+By default the API binds only to `127.0.0.1:8000` (safe behind a reverse proxy).
+
+### Health checks
 
 ```bash
-curl http://127.0.0.1:8000/health/live
-curl http://127.0.0.1:8000/health/ready
+curl http://127.0.0.1:8000/health/live   # always 200 if the process is up
+curl http://127.0.0.1:8000/health/ready  # 200 only after the pipeline + DB are ready
 ```
 
-Send a triage request (read the generated API key from `.env`):
+### Send a triage request
 
 ```bash
 set -a; source .env; set +a
+
 curl -s -X POST http://127.0.0.1:8000/triage \
   -H "X-API-Key: $TRIAGE_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"number":9002,"title":"Session cookie stays valid after logout","body":"Security issue: logout does not invalidate the cookie."}'
 ```
 
-The response includes severity, duplicate status, candidate files, suspect
-commits, assignees, and a generated repro-test draft. With the default
-`TRIAGE_MODE=synthetic`, results demonstrate the workflow only; they are not
-real repository findings.
+The response includes severity, duplicate status, candidate files, suspect commits, suggested assignees, and a generated repro-test draft.
+
+With the default `TRIAGE_MODE=synthetic`, results demonstrate the workflow only and are not real repository findings.
+
+---
+
+## Configuration reference
+
+All settings are read from environment variables (see `.env.example`).
+
+| Variable | Default | Description |
+|---|---|---|
+| `APP_ENV` | `development` | Set to `production` to enforce API key, hide docs |
+| `TRIAGE_MODE` | `synthetic` | `synthetic` or `github` |
+| `GITHUB_REPOSITORY` | — | `owner/repo` — required when `TRIAGE_MODE=github` |
+| `GITHUB_TOKEN` | — | Fine-grained PAT for private repos / higher API limits |
+| `TRIAGE_API_KEY` | — | Required in production; authenticates `/triage` calls |
+| `GITHUB_WEBHOOK_ENABLED` | `false` | Enable signed webhook listener |
+| `GITHUB_WEBHOOK_SECRET` | — | Required when webhooks are enabled |
+| `GITHUB_WRITEBACK` | `false` | Post triage report as a GitHub comment |
+| `EMBEDDING_BACKEND` | `hashing` | `hashing` (offline) or `sentence-transformers` (BGE) |
+| `EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Model name for sentence-transformers backend |
+| `LLM_BACKEND` | `stub` | `stub`, `hf`, or `openai_compat` |
+| `OPENAI_BASE_URL` | `http://localhost:11434/v1` | Base URL for OpenAI-compatible server (Ollama/vLLM) |
+| `DUP_THRESHOLD` | auto-calibrated | Similarity threshold for duplicate detection (0–1) |
+| `MAX_ISSUES` | `400` | Maximum issues to load from GitHub |
+| `MAX_COMMITS` | `3000` | Maximum commits to parse from the repo |
+| `RATE_LIMIT_REQUESTS` | `60` | Max requests per window on `POST /triage` |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding-window size for rate limiting |
+| `POSTGRES_PASSWORD` | — | Required; generated by `deploy.sh` on first run |
+| `QDRANT_API_KEY` | — | Required; generated by `deploy.sh` on first run |
+| `API_BIND_ADDRESS` | `127.0.0.1` | Interface the API port is published on |
+| `API_PORT` | `8000` | Host port for the API |
+
+---
 
 ## Use a real GitHub repository
 
-Edit `.env` and set:
+Edit `.env`:
 
 ```dotenv
 TRIAGE_MODE=github
 GITHUB_REPOSITORY=owner/repository
+GITHUB_TOKEN=ghp_...   # optional but recommended
 ```
 
-For private repositories or higher GitHub API limits, set a fine-grained
-`GITHUB_TOKEN` with read access to repository contents and issues. Then run
-`docker compose up -d --build --wait` again. The service clones the repository
-and indexes its issue and commit history during startup, so first startup can
-take several minutes. The checked-out source is cached in a persistent volume
-and incrementally fetched on restarts. Keep `EMBEDDING_BACKEND=hashing` for a smaller deployment;
-install the optional sentence-transformers dependency and choose
-`EMBEDDING_BACKEND=sentence-transformers` to use BGE embeddings.
+Then rebuild:
+
+```bash
+docker compose up -d --build --wait
+```
+
+The service clones the repository and indexes its issue and commit history during startup — first startup can take several minutes depending on repo size. The checkout is cached in a persistent volume and incrementally updated on restarts.
+
+Keep `EMBEDDING_BACKEND=hashing` for a lightweight deployment. Switch to `EMBEDDING_BACKEND=sentence-transformers` for higher-quality results; the BGE model is downloaded on first startup and cached in the `model_cache` volume.
+
+---
 
 ## GitHub webhooks and write-back
 
-For automatic triage on newly opened issues, deploy the service behind an
-HTTPS reverse proxy with a public URL. Set `API_BIND_ADDRESS=127.0.0.1` on the
-host so only that proxy can reach the container port. Configure a GitHub
-webhook for **Issues** events and set `GITHUB_WEBHOOK_ENABLED=true` and
-`GITHUB_WEBHOOK_SECRET` in `.env`. The service verifies GitHub's HMAC signature
-before processing payloads.
+To triage issues automatically as they are opened:
 
-GitHub comments are disabled by default. To enable them, set
-`GITHUB_WRITEBACK=true` and configure `GITHUB_TOKEN` with permission to write
-issue comments. The API key protects direct `/triage` calls; GitHub webhook
-requests use their webhook secret. Do not expose Qdrant or PostgreSQL ports to
-the public internet.
+1. Deploy the service behind an HTTPS reverse proxy with a public URL.
+2. Configure a GitHub webhook for **Issues** events pointing at `https://your-host/webhook/github`.
+3. Set in `.env`:
+   ```dotenv
+   GITHUB_WEBHOOK_ENABLED=true
+   GITHUB_WEBHOOK_SECRET=<same value as in GitHub>
+   ```
+4. To post the triage report back as a GitHub comment, also set:
+   ```dotenv
+   GITHUB_WRITEBACK=true
+   GITHUB_TOKEN=ghp_...   # needs Issues: write permission
+   ```
+
+The service verifies GitHub's HMAC-SHA256 signature before processing any payload. Do not expose the Qdrant or PostgreSQL ports to the public internet.
+
+---
 
 ## Manage the service
 
 ```bash
-docker compose logs -f api
-docker compose ps
-docker compose down          # stop containers; keeps database and vector data
-docker compose down -v       # permanently deletes persisted database/vector data
+docker compose logs -f api          # stream API logs
+docker compose ps                   # check container status
+docker compose restart api          # restart the API without rebuilding
+docker compose down                 # stop; keeps database and vector data
+docker compose down -v              # stop and permanently delete all data
+docker compose up -d --build --wait # rebuild and restart
 ```
+
+---
 
 ## Run the notebook in VS Code
 
-See [RUN_IN_VSCODE.txt](RUN_IN_VSCODE.txt). The notebook starts its own
-localhost-only demo API when all cells are run. Use the standalone Docker API
-for deployment; do not run both APIs on port 8000 at the same time.
+See [RUN_IN_VSCODE.txt](RUN_IN_VSCODE.txt). The notebook starts its own localhost demo API when all cells are run. Do not run both the notebook API and the Docker API on port 8000 at the same time.
+
+---
+
+## Troubleshooting
+
+**Startup takes too long / health check times out**
+
+The API has a 5-minute `start_period` on its health check to accommodate first-run corpus loading and optional model downloads. Check progress with:
+
+```bash
+docker compose logs -f api
+```
+
+**`POSTGRES_PASSWORD` or `QDRANT_API_KEY` errors on deploy**
+
+These secrets are generated automatically by `deploy.sh` on first run. If `.env` already exists without them, add the values manually or delete `.env` and re-run `./deploy.sh`.
+
+**Rate limit errors (HTTP 429)**
+
+The `/triage` endpoint defaults to 60 requests per 60 seconds per API key. Adjust with `RATE_LIMIT_REQUESTS` and `RATE_LIMIT_WINDOW_SECONDS` in `.env`.
+
+**`DUP_THRESHOLD` auto-calibration**
+
+When running in `synthetic` or `github` mode with labeled duplicates in the training split, the threshold is automatically calibrated at startup to maximise duplicate-detection F1. Set `DUP_THRESHOLD=0.86` in `.env` to pin it to a fixed value and skip calibration.
+
+**Qdrant connection errors at startup**
+
+The API depends on Qdrant being healthy before it starts (enforced by `depends_on` in `compose.yaml`). If you see connection errors in standalone mode (outside Docker Compose), ensure Qdrant is running and `QDRANT_URL` is set correctly.
+
+**Switching from `hashing` to `sentence-transformers` embeddings**
+
+Change `EMBEDDING_BACKEND=sentence-transformers` in `.env` and rebuild. The BGE model (~130 MB) is downloaded to the `model_cache` volume on first startup. Qdrant collections are recreated automatically with the new vector dimension.

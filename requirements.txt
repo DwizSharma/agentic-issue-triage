@@ -1,18 +1,22 @@
-# Core notebook and local FastAPI demo dependencies.
-rank-bm25
-qdrant-client
-langgraph
-scikit-learn
-pandas
-numpy
-requests
-fastapi
-uvicorn
-sqlalchemy
-pydantic
-nest_asyncio
-ipykernel
+# Development / notebook dependencies — pinned to match requirements-production.txt
+# where possible.  Run: pip install -r requirements.txt
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+pydantic>=2.8,<3
+sqlalchemy>=2.0,<3
+requests>=2.32,<3
+numpy>=2.0,<3
+scikit-learn>=1.5,<2
+rank-bm25>=0.2,<1
+qdrant-client>=1.13,<2
+langgraph>=1.0,<2
+python-dotenv>=1.0,<2
 
-# Optional: install sentence-transformers separately for BGE embeddings.
-# This pulls PyTorch and downloads the model on first notebook run.
-# sentence-transformers
+# Notebook-only extras (not needed in production)
+pandas>=2.2,<4
+nest_asyncio>=1.6,<2
+ipykernel>=6.29,<7
+
+# Optional: semantic embeddings (pulls PyTorch; downloads the BGE model on
+# first run).  Install separately when needed:
+# sentence-transformers>=3.0,<7
