@@ -11,6 +11,7 @@ rank-bm25>=0.2,<1
 qdrant-client>=1.13,<2
 langgraph>=1.0,<2
 python-dotenv>=1.0,<2
+aiofiles>=23.0,<25
 
 # Optional: connect to Ollama or any OpenAI-compatible LLM server
 # for real repro-test generation (set LLM_BACKEND=openai_compat in .env)

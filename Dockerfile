@@ -17,6 +17,7 @@ RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements-production.txt
 
 COPY app.py triage_engine.py ./
+COPY static/ ./static/
 RUN mkdir -p /app/model-cache /app/repo-cache \
     && chown -R app:app /app
 

@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic Issue Triage</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Highlight.js for code syntax colouring -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+
+<!-- ───────────── HEADER ───────────── -->
+<header class="site-header">
+  <div class="header-inner">
+    <div class="brand">
+      <span class="brand-icon">🤖</span>
+      <div>
+        <h1>Agentic Issue Triage</h1>
+        <p>AI-powered bug report analysis — severity · duplicates · blame · assignees · repro tests</p>
+      </div>
+    </div>
+    <div class="header-badges">
+      <span class="badge" id="badge-mode">mode: —</span>
+      <span class="badge" id="badge-llm">llm: —</span>
+      <span class="badge badge-status" id="badge-status">● connecting…</span>
+    </div>
+  </div>
+</header>
+
+<!-- ───────────── MAIN LAYOUT ───────────── -->
+<main class="layout">
+
+  <!-- LEFT — input form -->
+  <section class="panel panel-input">
+    <h2 class="panel-title">📋 Submit Bug Report</h2>
+
+    <form id="triage-form" autocomplete="off">
+
+      <div class="field">
+        <label for="issue-number">Issue Number</label>
+        <input id="issue-number" type="number" min="1" value="1001" required />
+      </div>
+
+      <div class="field">
+        <label for="issue-title">Title <span class="hint">be specific — the AI reads this carefully</span></label>
+        <input id="issue-title" type="text" maxlength="500" required
+               placeholder="e.g. Session cookie stays valid after logout" />
+      </div>
+
+      <div class="field">
+        <label for="issue-body">Description <span class="hint">paste stack traces, steps to reproduce, etc.</span></label>
+        <textarea id="issue-body" rows="7"
+                  placeholder="Describe the bug in detail. Include any error messages or tracebacks…"></textarea>
+      </div>
+
+      <div class="field field-api-key">
+        <label for="api-key">API Key <span class="hint">from your .env → TRIAGE_API_KEY</span></label>
+        <input id="api-key" type="password" placeholder="paste your API key here" />
+      </div>
+
+      <!-- Quick example buttons -->
+      <p class="examples-label">Quick examples:</p>
+      <div class="examples">
+        <button type="button" class="btn-example" data-example="auth">🔐 Auth bypass</button>
+        <button type="button" class="btn-example" data-example="db">🗄️ DB pool exhausted</button>
+        <button type="button" class="btn-example" data-example="invoice">💸 Invoice rounding</button>
+        <button type="button" class="btn-example" data-example="cache">⚡ Cache stale data</button>
+        <button type="button" class="btn-example" data-example="email">📧 Duplicate emails</button>
+      </div>
+
+      <button type="submit" class="btn-submit" id="btn-submit">
+        <span class="btn-text">Run Triage</span>
+        <span class="btn-spinner" hidden>⏳ Analysing…</span>
+      </button>
+    </form>
+  </section>
+
+  <!-- RIGHT — results -->
+  <section class="panel panel-results" id="results-panel">
+
+    <!-- empty state -->
+    <div class="empty-state" id="empty-state">
+      <div class="empty-icon">🔍</div>
+      <p>Submit a bug report on the left to see the AI triage results here.</p>
+    </div>
+
+    <!-- pipeline progress (shown while loading) -->
+    <div class="pipeline-progress" id="pipeline-progress" hidden>
+      <h2 class="panel-title">⚙️ Running pipeline…</h2>
+      <div class="steps">
+        <div class="step" id="step-classify"><span class="step-icon">○</span> Classifying severity</div>
+        <div class="step" id="step-dedup">   <span class="step-icon">○</span> Checking duplicates</div>
+        <div class="step" id="step-localize"><span class="step-icon">○</span> Locating broken file</div>
+        <div class="step" id="step-blame">   <span class="step-icon">○</span> Blaming suspect commit</div>
+        <div class="step" id="step-assign">  <span class="step-icon">○</span> Suggesting assignees</div>
+        <div class="step" id="step-repro">   <span class="step-icon">○</span> Generating repro test</div>
+        <div class="step" id="step-report">  <span class="step-icon">○</span> Writing report</div>
+      </div>
+    </div>
+
+    <!-- actual results (shown after success) -->
+    <div class="results-content" id="results-content" hidden>
+
+      <!-- top bar: issue title + severity badge -->
+      <div class="result-header">
+        <div class="result-title-row">
+          <span class="issue-number-badge" id="r-issue-num">#—</span>
+          <h2 class="result-issue-title" id="r-title">—</h2>
+        </div>
+        <span class="severity-badge" id="r-severity">—</span>
+      </div>
+
+      <!-- duplicate warning -->
+      <div class="duplicate-banner" id="r-dup-banner" hidden>
+        <span class="dup-icon">⚠️</span>
+        <div>
+          <strong>Likely duplicate</strong> of issue
+          <span class="dup-link" id="r-dup-id"></span> —
+          <em id="r-dup-title"></em>
+          <span class="dup-score" id="r-dup-score"></span>
+        </div>
+      </div>
+
+      <!-- cards grid -->
+      <div class="cards" id="r-cards">
+
+        <!-- Suspect Files card -->
+        <div class="card card-files" id="card-files">
+          <div class="card-header">
+            <span class="card-icon">📁</span>
+            <h3>Suspect Files</h3>
+            <span class="card-badge" id="r-files-count">0</span>
+          </div>
+          <ul class="file-list" id="r-files"></ul>
+        </div>
+
+        <!-- Suspect Commit card -->
+        <div class="card card-commit" id="card-commit">
+          <div class="card-header">
+            <span class="card-icon">🔍</span>
+            <h3>Suspect Commit</h3>
+          </div>
+          <div class="commit-box" id="r-commit"></div>
+        </div>
+
+        <!-- Assignees card -->
+        <div class="card card-assignees" id="card-assignees">
+          <div class="card-header">
+            <span class="card-icon">👤</span>
+            <h3>Suggested Assignees</h3>
+          </div>
+          <div class="assignee-list" id="r-assignees"></div>
+        </div>
+
+      </div><!-- /cards -->
+
+      <!-- ── HIGHLIGHTED SOURCE CODE (the issue location) ── -->
+      <div class="card card-code" id="card-code">
+        <div class="card-header">
+          <span class="card-icon">🐛</span>
+          <h3>Issue Location in Source Code</h3>
+          <span class="card-file-path" id="r-code-path"></span>
+        </div>
+        <div class="code-toolbar">
+          <span class="code-label">Most likely buggy area — highlighted in red</span>
+          <button class="btn-copy" id="btn-copy-code">Copy</button>
+        </div>
+        <div class="code-wrapper">
+          <pre><code class="language-python" id="r-code-block"></code></pre>
+        </div>
+      </div>
+
+      <!-- ── REPRO TEST ── -->
+      <div class="card card-repro" id="card-repro">
+        <div class="card-header">
+          <span class="card-icon">🧪</span>
+          <h3>Generated Repro Test</h3>
+          <span class="repro-source-badge" id="r-repro-source"></span>
+        </div>
+        <div class="code-toolbar">
+          <span class="code-label">Run with: <code>pytest</code></span>
+          <button class="btn-copy" id="btn-copy-repro">Copy</button>
+        </div>
+        <div class="code-wrapper">
+          <pre><code class="language-python" id="r-repro-block"></code></pre>
+        </div>
+      </div>
+
+      <!-- ── FULL REPORT ── -->
+      <div class="card card-report" id="card-report">
+        <div class="card-header">
+          <span class="card-icon">📝</span>
+          <h3>Full Triage Report</h3>
+          <span class="hint">ready to paste as a GitHub comment</span>
+        </div>
+        <div class="code-toolbar">
+          <button class="btn-copy" id="btn-copy-report">Copy Markdown</button>
+        </div>
+        <pre class="report-pre" id="r-report"></pre>
+      </div>
+
+    </div><!-- /results-content -->
+
+    <!-- error state -->
+    <div class="error-state" id="error-state" hidden>
+      <div class="error-icon">❌</div>
+      <p id="error-msg">Something went wrong.</p>
+      <button class="btn-retry" onclick="document.getElementById('error-state').hidden=true">Dismiss</button>
+    </div>
+
+  </section>
+</main>
+
+<!-- ───────────── HISTORY DRAWER ───────────── -->
+<div class="history-bar">
+  <button class="btn-history-toggle" id="btn-history-toggle">📜 History (<span id="history-count">0</span>)</button>
+  <div class="history-list" id="history-list"></div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

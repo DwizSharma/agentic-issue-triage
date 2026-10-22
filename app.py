@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -23,6 +24,8 @@ except ImportError:
 
 import requests
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import Column, DateTime, Integer, JSON, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -30,77 +33,89 @@ from starlette.concurrency import run_in_threadpool
 
 LOG = logging.getLogger("triage")
 
-APP_ENV = os.getenv("APP_ENV", "development").lower()
-IS_PRODUCTION = APP_ENV == "production"
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./triage.db")
-API_KEY = os.getenv("TRIAGE_API_KEY")
-WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
-WEBHOOK_ENABLED = os.getenv("GITHUB_WEBHOOK_ENABLED", "false").lower() == "true"
-WRITEBACK_ENABLED = os.getenv("GITHUB_WRITEBACK", "false").lower() == "true"
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-MAX_WEBHOOK_BYTES = 1_000_000
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+APP_ENV          = os.getenv("APP_ENV", "development").lower()
+IS_PRODUCTION    = APP_ENV == "production"
+DATABASE_URL     = os.getenv("DATABASE_URL", "sqlite:///./triage.db")
+API_KEY          = os.getenv("TRIAGE_API_KEY")
+WEBHOOK_SECRET   = os.getenv("GITHUB_WEBHOOK_SECRET")
+WEBHOOK_ENABLED  = os.getenv("GITHUB_WEBHOOK_ENABLED", "false").lower() == "true"
+WRITEBACK_ENABLED= os.getenv("GITHUB_WRITEBACK", "false").lower() == "true"
+GITHUB_TOKEN     = os.getenv("GITHUB_TOKEN")
+MAX_WEBHOOK_BYTES= 1_000_000
+
+# Static files directory (sits next to app.py)
+STATIC_DIR = Path(__file__).parent / "static"
 
 # ---------------------------------------------------------------------------
-# Rate limiter — simple in-process sliding-window counter.
-# Default: 60 requests per 60 seconds per API key (or per remote IP when no
-# key is configured).  Override via env vars RATE_LIMIT_REQUESTS /
-# RATE_LIMIT_WINDOW_SECONDS.
+# Rate limiter — sliding-window per API key or remote IP
 # ---------------------------------------------------------------------------
 _RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "60"))
-_RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
-
+_RATE_LIMIT_WINDOW   = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 _rate_buckets: dict[str, deque] = {}
 _rate_lock = threading.Lock()
 
 
 def _check_rate_limit(client_id: str) -> None:
     """Raise HTTP 429 if *client_id* has exceeded the sliding-window quota."""
-    now = time.monotonic()
+    now    = time.monotonic()
     cutoff = now - _RATE_LIMIT_WINDOW
     with _rate_lock:
         bucket = _rate_buckets.setdefault(client_id, deque())
-        # Evict timestamps outside the current window
         while bucket and bucket[0] < cutoff:
             bucket.popleft()
         if len(bucket) >= _RATE_LIMIT_REQUESTS:
             raise HTTPException(
                 status_code=429,
                 detail=(
-                    f"Rate limit exceeded — max {_RATE_LIMIT_REQUESTS} requests "
-                    f"per {_RATE_LIMIT_WINDOW}s."
+                    f"Rate limit exceeded — max {_RATE_LIMIT_REQUESTS} "
+                    f"requests per {_RATE_LIMIT_WINDOW}s."
                 ),
                 headers={"Retry-After": str(_RATE_LIMIT_WINDOW)},
             )
         bucket.append(now)
 
 
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
 Base = declarative_base()
 
 
 class TriageResult(Base):
     __tablename__ = "triage_results"
 
-    id = Column(Integer, primary_key=True)
-    repo = Column(String(300), nullable=False, index=True)
+    id           = Column(Integer, primary_key=True)
+    repo         = Column(String(300), nullable=False, index=True)
     issue_number = Column(Integer, nullable=False, index=True)
-    title = Column(Text, nullable=False)
-    severity = Column(String(20), nullable=False)
+    title        = Column(Text, nullable=False)
+    severity     = Column(String(20), nullable=False)
     duplicate_of = Column(Integer, nullable=True)
-    files = Column(JSON, nullable=True)
-    suspect_sha = Column(String(64), nullable=True)
-    assignees = Column(JSON, nullable=True)
-    repro_test = Column(Text, nullable=True)
-    created_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    files        = Column(JSON, nullable=True)
+    suspect_sha  = Column(String(64), nullable=True)
+    assignees    = Column(JSON, nullable=True)
+    repro_test   = Column(Text, nullable=True)
+    created_at   = Column(
+        DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP")
+    )
 
 
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 class IssueIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     number: int = Field(gt=0)
-    title: str = Field(min_length=1, max_length=500)
-    body: str = Field(default="", max_length=50_000)
+    title:  str = Field(min_length=1, max_length=500)
+    body:   str = Field(default="", max_length=50_000)
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 def persist(session_factory, state: dict[str, Any], repo: str) -> None:
     issue = state["issue"]
     with session_factory() as session:
@@ -120,7 +135,9 @@ def persist(session_factory, state: dict[str, Any], repo: str) -> None:
 
 def post_comment(repo: str, number: int, report: str) -> None:
     if not GITHUB_TOKEN:
-        raise HTTPException(status_code=503, detail="GitHub write-back requires GITHUB_TOKEN")
+        raise HTTPException(
+            status_code=503, detail="GitHub write-back requires GITHUB_TOKEN"
+        )
     response = requests.post(
         f"https://api.github.com/repos/{repo}/issues/{number}/comments",
         headers={
@@ -132,10 +149,37 @@ def post_comment(repo: str, number: int, report: str) -> None:
         timeout=(5, 20),
     )
     if not response.ok:
-        LOG.error("GitHub comment write failed: %s %s", response.status_code, response.text[:500])
+        LOG.error(
+            "GitHub comment write failed: %s %s",
+            response.status_code, response.text[:500],
+        )
         raise HTTPException(status_code=502, detail="GitHub comment write failed")
 
 
+def _bug_keywords_for(issue_title: str, issue_body: str) -> list[str]:
+    """
+    Extract short keywords from the issue text that are likely to appear
+    on the buggy lines of source code — used by the UI to highlight them.
+    """
+    text  = f"{issue_title} {issue_body}".lower()
+    # Pull out function-like words, error names, domain terms
+    words = re.findall(r"[a-z][a-z0-9_]{3,}", text)
+    # Keep only words that feel like code identifiers (contain _ or are camel-ish)
+    code_words = [
+        w for w in words
+        if "_" in w or re.search(r"[a-z][A-Z]", w) or len(w) > 8
+    ]
+    # Also keep explicit domain keywords from the title
+    title_words = [
+        w.lower() for w in re.findall(r"[A-Za-z]{4,}", issue_title)
+    ]
+    combined = list(dict.fromkeys(code_words + title_words))  # deduplicate, preserve order
+    return combined[:20]
+
+
+# ---------------------------------------------------------------------------
+# App lifespan
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if IS_PRODUCTION and not API_KEY:
@@ -144,22 +188,26 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("GITHUB_WEBHOOK_SECRET is required when webhooks are enabled")
     if WRITEBACK_ENABLED and not GITHUB_TOKEN:
         raise RuntimeError("GITHUB_TOKEN is required when GitHub write-back is enabled")
-    if os.getenv("TRIAGE_MODE", "synthetic").lower() == "github" and not os.getenv("GITHUB_REPOSITORY"):
+    if (
+        os.getenv("TRIAGE_MODE", "synthetic").lower() == "github"
+        and not os.getenv("GITHUB_REPOSITORY")
+    ):
         raise RuntimeError("GITHUB_REPOSITORY is required when TRIAGE_MODE=github")
 
     db = create_engine(DATABASE_URL, pool_pre_ping=True)
     Base.metadata.create_all(db)
-    app.state.db = db
+    app.state.db       = db
     app.state.sessions = sessionmaker(bind=db, expire_on_commit=False)
 
-    # Heavy corpus/model/index initialization happens once per service process.
-    import triage_engine as pipeline
-    app.state.pipeline = pipeline
+    # Heavy corpus / model / index initialisation — once per process
+    import triage_engine as pipeline          # noqa: PLC0415
+    app.state.pipeline      = pipeline
     app.state.pipeline_lock = threading.Lock()
     LOG.info(
-        "Triage pipeline ready (mode=%s, embeddings=%s)",
+        "Triage pipeline ready (mode=%s, embeddings=%s, llm=%s)",
         pipeline.CFG["MODE"],
         pipeline.EMBEDDING_BACKEND,
+        pipeline.CFG["LLM_BACKEND"],
     )
     try:
         yield
@@ -171,6 +219,9 @@ async def lifespan(app: FastAPI):
             pass
 
 
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
 app = FastAPI(
     title="Agentic Issue Triage",
     version="1.0.0",
@@ -180,20 +231,20 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Mount static files (CSS / JS / any assets) at /static
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+
+# ---------------------------------------------------------------------------
+# Auth helper
+# ---------------------------------------------------------------------------
 def require_api_key(supplied: str | None) -> None:
-    """Validate the supplied API key using a constant-time comparison.
-
-    Rules:
-    - If TRIAGE_API_KEY is set, it is **always** enforced (dev and production).
-    - In production mode, the key must also be configured or the service is
-      considered mis-configured and returns 503.
-    """
+    """Constant-time API key check.  Always enforced when a key is configured."""
     if API_KEY:
         if not supplied or not hmac.compare_digest(supplied, API_KEY):
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
     elif IS_PRODUCTION:
-        # Production with no key configured → fail closed
         raise HTTPException(status_code=503, detail="API key is not configured")
 
 
@@ -205,6 +256,21 @@ def run_triage(app: FastAPI, issue: dict[str, Any], repo: str) -> dict[str, Any]
     return state
 
 
+# ---------------------------------------------------------------------------
+# UI routes
+# ---------------------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def serve_ui():
+    """Serve the web UI (index.html)."""
+    index = STATIC_DIR / "index.html"
+    if not index.exists():
+        raise HTTPException(status_code=404, detail="UI not found")
+    return FileResponse(str(index))
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 @app.get("/health/live")
 def live():
     return {"status": "alive"}
@@ -223,56 +289,137 @@ def ready(request: Request):
     return {"status": "ready", "mode": request.app.state.pipeline.CFG["MODE"]}
 
 
+# ---------------------------------------------------------------------------
+# Config endpoint — tells the UI which LLM backend is active
+# ---------------------------------------------------------------------------
+@app.get("/config")
+def config(request: Request):
+    p = request.app.state.pipeline
+    return {
+        "mode":         p.CFG["MODE"],
+        "llm_backend":  p.CFG["LLM_BACKEND"],
+        "openai_model": p.CFG.get("OPENAI_MODEL", ""),
+        "embedding":    p.EMBEDDING_BACKEND,
+        "dup_threshold":p.CFG["DUP_THRESHOLD"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Source file endpoint — returns file content + bug hint metadata for the UI
+# ---------------------------------------------------------------------------
+@app.get("/source")
+def get_source(path: str, request: Request):
+    """
+    Return the source of a corpus file so the UI can syntax-highlight it
+    and mark the suspected buggy lines.
+
+    Query param:
+      path  — corpus-relative file path, e.g. src/auth/session.py
+      issue_title / issue_body — optional, used to compute bug_keywords
+    """
+    if not hasattr(request.app.state, "pipeline"):
+        raise HTTPException(status_code=503, detail="Pipeline not ready")
+
+    corpus = request.app.state.pipeline.corpus
+
+    # Sanitise: only allow paths that actually exist in the corpus
+    if path not in corpus.files:
+        raise HTTPException(status_code=404, detail=f"File not in corpus: {path}")
+
+    source = corpus.files[path]
+
+    # --- derive bug keywords from the last triage call stored in DB ---
+    issue_title = request.query_params.get("issue_title", "")
+    issue_body  = request.query_params.get("issue_body", "")
+    keywords    = _bug_keywords_for(issue_title, issue_body)
+
+    # --- mark suspect lines: lines that contain any of the bug keywords ---
+    suspect_lines: list[int] = []
+    for i, line in enumerate(source.split("\n"), start=1):
+        line_lower = line.lower()
+        if any(kw in line_lower for kw in keywords):
+            suspect_lines.append(i)
+
+    # --- also mark lines touched by the module's known symptom vocabulary ---
+    # (pulled from the MODULES dict in synthetic mode)
+    module_vocab: list[str] = []
+    modules = getattr(request.app.state.pipeline, "MODULES", {})
+    if path in modules:
+        module_vocab = modules[path].get("vocab", "").split()
+
+    for i, line in enumerate(source.split("\n"), start=1):
+        if any(v in line.lower() for v in module_vocab):
+            if i not in suspect_lines:
+                suspect_lines.append(i)
+
+    # Limit to at most 8 highlighted lines so the display stays readable
+    suspect_lines = sorted(suspect_lines)[:8]
+
+    return {
+        "path":         path,
+        "source":       source,
+        "bug_keywords": keywords,
+        "suspect_lines":suspect_lines,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Triage
+# ---------------------------------------------------------------------------
 @app.post("/triage")
 def triage(
-    issue: IssueIn,
-    request: Request,
+    issue:     IssueIn,
+    request:   Request,
     x_api_key: str | None = Header(default=None),
 ):
     require_api_key(x_api_key)
-    # Rate-limit by API key when present, otherwise by remote IP
     client_id = x_api_key or (request.client.host if request.client else "unknown")
     _check_rate_limit(client_id)
 
     state = run_triage(
         request.app,
         {
-            "id": issue.number,
-            "title": issue.title,
-            "body": issue.body,
-            "created": time.time(),
+            "id":       issue.number,
+            "title":    issue.title,
+            "body":     issue.body,
+            "created":  time.time(),
             "severity": None,
         },
         repo="api",
     )
     return {
-        "severity": state["severity"],
-        "duplicate": state.get("duplicate"),
-        "files": state.get("files"),
-        "suspects": state.get("suspects"),
-        "assignees": state.get("assignees"),
+        "severity":   state["severity"],
+        "duplicate":  state.get("duplicate"),
+        "files":      state.get("files"),
+        "suspects":   state.get("suspects"),
+        "assignees":  state.get("assignees"),
         "repro_test": state.get("repro_test"),
-        "report": state["report"],
+        "report":     state["report"],
     }
 
 
+# ---------------------------------------------------------------------------
+# GitHub webhook
+# ---------------------------------------------------------------------------
 @app.post("/webhook/github")
 async def github_webhook(
-    request: Request,
-    x_hub_signature_256: str | None = Header(default=None),
-    x_github_event: str | None = Header(default=None),
+    request:              Request,
+    x_hub_signature_256:  str | None = Header(default=None),
+    x_github_event:       str | None = Header(default=None),
 ):
     if not WEBHOOK_ENABLED:
         raise HTTPException(status_code=404, detail="GitHub webhook is disabled")
 
-    # Guard: WEBHOOK_SECRET must be set (lifespan enforces this, but be
-    # explicit here so an AttributeError can never surface as a 500).
     if not WEBHOOK_SECRET:
         LOG.error("Webhook received but GITHUB_WEBHOOK_SECRET is not configured")
         raise HTTPException(status_code=503, detail="Webhook secret is not configured")
 
     declared_size = request.headers.get("content-length")
-    if declared_size and declared_size.isdigit() and int(declared_size) > MAX_WEBHOOK_BYTES:
+    if (
+        declared_size
+        and declared_size.isdigit()
+        and int(declared_size) > MAX_WEBHOOK_BYTES
+    ):
         raise HTTPException(status_code=413, detail="Webhook payload is too large")
 
     body = await request.body()
@@ -297,7 +444,7 @@ async def github_webhook(
         return {"ignored": True, "reason": "not a newly opened issue"}
 
     issue = payload["issue"]
-    repo = payload.get("repository", {}).get("full_name")
+    repo  = payload.get("repository", {}).get("full_name")
 
     if isinstance(issue, dict) and "pull_request" in issue:
         return {"ignored": True, "reason": "pull requests are not issue tickets"}
@@ -308,8 +455,8 @@ async def github_webhook(
     try:
         normalized_issue = IssueIn.model_validate({
             "number": issue.get("number"),
-            "title": issue.get("title"),
-            "body": issue.get("body") or "",
+            "title":  issue.get("title"),
+            "body":   issue.get("body") or "",
         })
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail="Invalid GitHub issue fields") from exc
@@ -318,16 +465,18 @@ async def github_webhook(
         run_triage,
         request.app,
         {
-            "id": normalized_issue.number,
-            "title": normalized_issue.title,
-            "body": normalized_issue.body,
-            "created": time.time(),
+            "id":       normalized_issue.number,
+            "title":    normalized_issue.title,
+            "body":     normalized_issue.body,
+            "created":  time.time(),
             "severity": None,
         },
         repo,
     )
 
     if WRITEBACK_ENABLED:
-        await run_in_threadpool(post_comment, repo, normalized_issue.number, state["report"])
+        await run_in_threadpool(
+            post_comment, repo, normalized_issue.number, state["report"]
+        )
 
     return {"ok": True, "severity": state["severity"], "report": state["report"]}
